@@ -4254,7 +4254,9 @@ public class WifiStateMachine extends StateMachine {
                                 log("Reconfiguring IP on connection");
                                 // TODO(b/36576642): clear addresses and disable IPv6
                                 // to simplify obtainingIpState.
-                                transitionTo(mObtainingIpState);
+                                mWifiNative.disconnect(mInterfaceName);
+                                handleNetworkDisconnect();
+                                startConnectToNetwork(netId,message.sendingUid, SUPPLICANT_BSSID_ANY);
                             }
                         }
                     }
