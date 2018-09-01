@@ -1164,6 +1164,10 @@ public class WifiP2pServiceImpl extends IWifiP2pManager.Stub {
                             Log.e(TAG, "Ignore P2P enable since wifi is disabled");
                             break;
                         }
+                        if (android.os.SystemProperties.getBoolean("wifi.direct.non-concurrent", false)) {
+                            Log.w(TAG, "Device does not support concurrent usage of STA and P2P");
+                            break;
+                        }
                         mInterfaceName = mWifiNative.setupInterface((String ifaceName) -> {
                             sendMessage(DISABLE_P2P);
                         }, getHandler());
