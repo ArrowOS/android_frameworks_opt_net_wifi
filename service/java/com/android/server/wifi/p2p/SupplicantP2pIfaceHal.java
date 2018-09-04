@@ -1959,6 +1959,9 @@ public class SupplicantP2pIfaceHal {
                         && !resultSsid.getResult().isEmpty()) {
                     group.setNetworkName(NativeUtil.removeEnclosingQuotes(
                             NativeUtil.encodeSsid(resultSsid.getResult())));
+                } else {
+                    Log.e(TAG, "group ssid is invalid! resultSsid = " + resultSsid);
+                    continue;
                 }
 
                 SupplicantResult<byte[]> resultBssid =
