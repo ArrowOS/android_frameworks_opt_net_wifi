@@ -765,6 +765,11 @@ public class ClientModeImpl extends StateMachine {
     private final WrongPasswordNotifier mWrongPasswordNotifier;
     private WifiNetworkSuggestionsManager mWifiNetworkSuggestionsManager;
     private boolean mConnectedMacRandomzationSupported;
+    // Maximum duration to continue to log Wifi usability stats after a data stall is triggered.
+    @VisibleForTesting
+    public static final long DURATION_TO_WAIT_ADD_STATS_AFTER_DATA_STALL_MS = 30 * 1000;
+    private long mDataStallTriggerTimeMs = -1;
+    private int mLastStatusDataStall = WifiIsUnusableEvent.TYPE_UNKNOWN;
 
     public ClientModeImpl(Context context, FrameworkFacade facade, Looper looper,
                             UserManager userManager, WifiInjector wifiInjector,
@@ -959,6 +964,8 @@ public class ClientModeImpl extends StateMachine {
                 mWifiMetrics.getHandler());
         mWifiMonitor.registerHandler(mInterfaceName, CMD_TARGET_BSSID,
                 mWifiMetrics.getHandler());
+        mWifiMonitor.registerHandler(mInterfaceName, WifiMonitor.NETWORK_CONNECTION_EVENT,
+                mWifiInjector.getWifiLastResortWatchdog().getHandler());
     }
 
     private void setMulticastFilter(boolean enabled) {
@@ -1106,7 +1113,7 @@ public class ClientModeImpl extends StateMachine {
         setSupplicantLogLevel();
         mCountryCode.enableVerboseLogging(verbose);
         mWifiScoreReport.enableVerboseLogging(mVerboseLoggingEnabled);
-        mWifiDiagnostics.startLogging(mVerboseLoggingEnabled);
+        mWifiDiagnostics.enableVerboseLogging(mVerboseLoggingEnabled);
         mWifiMonitor.enableVerboseLogging(verbose);
         mWifiNative.enableVerboseLogging(verbose);
         mWifiConfigManager.enableVerboseLogging(verbose);
@@ -3765,7 +3772,9 @@ public class ClientModeImpl extends StateMachine {
         setRandomMacOui();
         mCountryCode.setReadyForChange(true);
 
-        mWifiDiagnostics.startLogging(mVerboseLoggingEnabled);
+        mWifiDiagnostics.startPktFateMonitoring(mInterfaceName);
+        mWifiDiagnostics.startLogging(mInterfaceName);
+
         mIsRunning = true;
         updateBatteryWorkSource(null);
 
@@ -3803,7 +3812,7 @@ public class ClientModeImpl extends StateMachine {
      */
     private void stopClientMode() {
         // exiting supplicant started state is now only applicable to client mode
-        mWifiDiagnostics.stopLogging();
+        mWifiDiagnostics.stopLogging(mInterfaceName);
 
         mIsRunning = false;
         updateBatteryWorkSource(null);
@@ -4287,10 +4296,12 @@ public class ClientModeImpl extends StateMachine {
                             && TextUtils.isEmpty(config.enterpriseConfig.getAnonymousIdentity())) {
                         String anonAtRealm = TelephonyUtil.getAnonymousIdentityWith3GppRealm(
                                 getTelephonyManager());
+                        // Use anonymous@<realm> when pseudonym is not available
                         config.enterpriseConfig.setAnonymousIdentity(anonAtRealm);
                     }
 
                     if (mWifiNative.connectToNetwork(mInterfaceName, config)) {
+                        mWifiInjector.getWifiLastResortWatchdog().noteStartConnectTime();
                         mWifiMetrics.logStaEvent(StaEvent.TYPE_CMD_START_CONNECT, config);
                         mLastConnectAttemptTimestamp = mClock.getWallClockMillis();
                         mTargetWifiConfiguration = config;
@@ -4450,21 +4461,17 @@ public class ClientModeImpl extends StateMachine {
                         // We need to get the updated pseudonym from supplicant for EAP-SIM/AKA/AKA'
                         if (config.enterpriseConfig != null
                                 && TelephonyUtil.isSimEapMethod(
-                                        config.enterpriseConfig.getEapMethod())
-                                // if using anonymous@<realm>, do not use pseudonym identity on
-                                // reauthentication. Instead, use full authentication using
-                                // anonymous@<realm> followed by encrypted IMSI every time.
-                                // This is because the encrypted IMSI spec does not specify its
-                                // compatibility with the pseudonym identity specified by EAP-AKA.
-                                && !TelephonyUtil.isAnonymousAtRealmIdentity(
-                                        config.enterpriseConfig.getAnonymousIdentity())) {
+                                        config.enterpriseConfig.getEapMethod())) {
                             String anonymousIdentity =
                                     mWifiNative.getEapAnonymousIdentity(mInterfaceName);
                             if (mVerboseLoggingEnabled) {
                                 log("EAP Pseudonym: " + anonymousIdentity);
                             }
-                            config.enterpriseConfig.setAnonymousIdentity(anonymousIdentity);
-                            mWifiConfigManager.addOrUpdateNetwork(config, Process.WIFI_UID);
+                            if (!TelephonyUtil.isAnonymousAtRealmIdentity(anonymousIdentity)) {
+                                // Save the pseudonym only if it is a real one
+                                config.enterpriseConfig.setAnonymousIdentity(anonymousIdentity);
+                                mWifiConfigManager.addOrUpdateNetwork(config, Process.WIFI_UID);
+                            }
                         }
                         sendNetworkStateChangeBroadcast(mLastBssid);
                         transitionTo(mObtainingIpState);
@@ -5107,11 +5114,24 @@ public class ClientModeImpl extends StateMachine {
                             }
                             mWifiScoreReport.noteIpCheck();
                         }
-                        int statusDataStall =
-                                mWifiDataStall.checkForDataStall(mLastLinkLayerStats, stats);
-                        if (statusDataStall != WifiIsUnusableEvent.TYPE_UNKNOWN) {
-                            mWifiMetrics.addToWifiUsabilityStatsList(WifiUsabilityStats.LABEL_BAD,
-                                    convertToUsabilityStatsTriggerType(statusDataStall), -1);
+                        int statusDataStall = mWifiDataStall.checkForDataStall(
+                                mLastLinkLayerStats, stats, mWifiInfo);
+                        if (mDataStallTriggerTimeMs == -1
+                                && statusDataStall != WifiIsUnusableEvent.TYPE_UNKNOWN) {
+                            mDataStallTriggerTimeMs = mClock.getElapsedSinceBootMillis();
+                            mLastStatusDataStall = statusDataStall;
+                        }
+                        if (mDataStallTriggerTimeMs != -1) {
+                            long elapsedTime =  mClock.getElapsedSinceBootMillis()
+                                    - mDataStallTriggerTimeMs;
+                            if (elapsedTime >= DURATION_TO_WAIT_ADD_STATS_AFTER_DATA_STALL_MS) {
+                                mDataStallTriggerTimeMs = -1;
+                                mWifiMetrics.addToWifiUsabilityStatsList(
+                                        WifiUsabilityStats.LABEL_BAD,
+                                        convertToUsabilityStatsTriggerType(mLastStatusDataStall),
+                                        -1);
+                                mLastStatusDataStall = WifiIsUnusableEvent.TYPE_UNKNOWN;
+                            }
                         }
                         mWifiMetrics.incrementWifiLinkLayerUsageStats(stats);
                         mLastLinkLayerStats = stats;
