@@ -3927,7 +3927,7 @@ public class WifiServiceImplTest {
                 mWifiServiceImpl.addNetworkSuggestions(mock(List.class), TEST_PACKAGE_NAME));
 
         verify(mWifiNetworkSuggestionsManager, times(2)).add(
-                any(), eq(Binder.getCallingUid()),  eq(TEST_PACKAGE_NAME));
+                any(), eq(Binder.getCallingUid()), eq(TEST_PACKAGE_NAME));
     }
 
     /**
